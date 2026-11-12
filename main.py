@@ -1,62 +1,49 @@
 #!/usr/bin/env python3
-"""Forecast Roblox's Up-and-Coming top 10 for make.fun (roblox-up-and-coming-forecast-01).
+"""Forecast Roblox's Up-and-Coming top 10 (roblox-up-and-coming-forecast-01).
 
 Reads the chart history at $MAKEFUN_INPUT_DIR (else /input) and writes one
-forecast to $MAKEFUN_OUTPUT_DIR (else /output): for each of the top 10 places a
-probability distribution over games, plus an ordered top 10. The single
-forecast is scored by log score against every hourly chart read in the 72
-hours after the history ends, so this program estimates the *time-averaged*
-place distribution over that window.
+forecast to $MAKEFUN_OUTPUT_DIR (else /output): for each of the top 10
+places a probability distribution over games, plus an ordered top 10. The
+single forecast is scored by log score against every hourly chart read in
+the 72 hours after the history ends, so the quantity that pays is the
+*time-averaged* probability that each game holds each place over the
+window -- a marginal distribution, not a trajectory.
 
-Model, fitted from the history itself:
-  * Latent strength per game: a recency-weighted mean of exp(-(rank-1)/12)
-    over every read (absent from the chart counts as 0), half-life 22 h.
-  * Momentum: a shrunk, clamped per-hour slope of that value over time.
-  * Ageing out: when the history's details carry a game's `created` date, the
-    game leaves the chart 28 days after publication; it is excluded from the
-    simulated hours past that point.
-  * Monte-Carlo: for each forecast hour h = 1..72, strengths drift, Gaussian
-    noise with standard deviation growing like sqrt(h) is added (scale set
-    from the churn measured in the history), games are ranked, and the place
-    counts are averaged over hours and draws. A per-place share is left
-    unnamed on purpose: it is the probability that the place is held by a
-    game outside the modelled field (new publications enter this chart
-    constantly), and the scoring spreads it over every unnamed chart game.
+Model: the empirical place-occupancy table of the history itself.
+  * Each read contributes its top 10 to a per-(game, place) count, weighted
+    by recency with a 6-hour half-life, so the table describes the chart's
+    current regime rather than its whole past.
+  * Counts are shrunk toward the game's overall top-10 presence share
+    (strength 10): a place a game held rarely still gets the probability
+    its general presence earns, which keeps the table honest when the
+    recency-weighted sample is a handful of reads.
+  * A mild temperature (0.95) is applied and each place is renormalised,
+    then 15% of every place is left unnamed: the share for games outside
+    the history's top 10 (new publications enter this chart constantly),
+    which the scoring spreads over the read's unnamed chart games.
+  * The top 10 list is a greedy assignment on the marginal matrix: the
+    largest remaining (game, place) probability is fixed first, which is
+    the order that maximises expected agreement.
 
-Deterministic: a fixed seed, no clock, no network, standard library only.
+Deterministic: no randomness, no clock, no network, standard library only.
 """
 
 import json
 import math
 import os
-import random
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 
-SEED = 20261113
-RANK_SCALE = 12.0          # exp(-(rank-1)/RANK_SCALE): rank 1 -> 1, rank 10 -> 0.47
-HALF_LIFE_H = 22.0         # recency weight half-life for strength
-DRIFT_CAP = 0.008          # max |strength drift| per hour
-DRIFT_SHRINK = 6.0         # slope shrinkage: n/(n+DRIFT_SHRINK)
-SIGMA_24 = 0.27            # ranking noise (strength units) at a 24 h horizon
-SIGMA_MIN_FRAC = 0.35      # noise floor as a fraction of the 72 h noise
-DRAWS = 160                # Monte-Carlo rankings drawn per forecast hour
-MIN_ROW_P = 0.003          # smallest probability worth naming a row for
+HALF_LIFE_H = 6.0        # recency half-life of a read's weight, in hours
+SHRINKAGE = 10.0         # pseudo-count strength of the presence prior
+TEMPERATURE = 0.95       # p -> p ** (1 / T), renormalised per place
+UNNAMED = 0.15           # share of each place left for games outside the table
+MIN_ROW_P = 0.001        # smallest probability worth naming a row for
 MAX_ROWS_PER_PLACE = 100
-AGE_LIMIT_DAYS = 28.0
-# Share of each place deliberately left unnamed (the field outside the model).
-# Backtests on the practice history put the optimum near a flat quarter: the
-# winner of a place is often a game the model rates low, and the scoring
-# spreads this share over every unnamed game on the read's chart.
-UNNAMED = {k: 0.25 for k in range(1, 11)}
 
 
 def parse_time(text):
     return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
-
-
-def rank_value(rank):
-    return math.exp(-(rank - 1) / RANK_SCALE)
 
 
 def load_history(input_dir):
@@ -68,176 +55,71 @@ def load_history(input_dir):
                 continue
             rec = json.loads(line)
             chart = rec.get("up_and_coming") or []
+            # The list is the chart in its order, so a game's place is its
+            # position; dedupe defensively (a game listed twice in one read
+            # would otherwise be counted at two places).
             rows = []
+            seen = set()
             for g in chart:
-                if g.get("universe_id") is None or g.get("rank") is None:
+                if g.get("universe_id") is None:
                     continue
-                rows.append((int(g["rank"]), int(g["universe_id"])))
+                uid = int(g["universe_id"])
+                if uid in seen:
+                    continue
+                seen.add(uid)
+                rows.append((len(rows) + 1, uid))
             if rows:
-                rows.sort()
-                reads.append({"t": parse_time(rec["at"]), "rows": rows,
-                              "details": rec.get("details")})
+                reads.append({"t": parse_time(rec["at"]), "rows": rows})
     reads.sort(key=lambda r: r["t"])
     return reads
 
 
-def created_epochs(reads):
-    """Latest known publication time per game, from any read's details."""
-    created = {}
-    for rec in reads:
-        det = rec["details"]
-        if not det:
-            continue
-        items = det.items() if isinstance(det, dict) else (
-            (d.get("universe_id") or d.get("id"), d) for d in det if isinstance(d, dict))
-        for key, d in items:
-            if not isinstance(d, dict) or not d.get("created"):
-                continue
-            try:
-                uid = int(d.get("universe_id") or key)
-            except (TypeError, ValueError):
-                continue
-            try:
-                created[uid] = parse_time(d["created"])
-            except (TypeError, ValueError):
-                pass
-    return created
-
-
-def churn_rate(reads):
-    """Mean share of top-10 places changing occupant per sqrt(hour of gap)."""
-    num = 0.0
-    den = 0.0
-    for a, b in zip(reads, reads[1:]):
-        gap_h = max((b["t"] - a["t"]) / 3600.0, 0.25)
-        top_a = [u for _, u in a["rows"][:10]]
-        top_b = [u for _, u in b["rows"][:10]]
-        changed = sum(1 for x, y in zip(top_a, top_b) if x != y) / 10.0
-        num += changed
-        den += math.sqrt(gap_h)
-    if den == 0:
-        return 0.24
-    return num / den
-
-
-def strengths(reads, t_end):
-    """Per-game strength and drift from the reads, as of t_end."""
-    series = {}   # uid -> list of (t, value)
-    for rec in reads:
-        seen = {}
-        for rank, uid in rec["rows"]:
-            seen[uid] = rank_value(rank)
-        for uid, val in seen.items():
-            series.setdefault(uid, []).append((rec["t"], val))
-        for uid in series:
-            if uid not in seen:
-                series[uid].append((rec["t"], 0.0))
-    theta, drift = {}, {}
-    for uid, pts in series.items():
-        pts.sort()
-        wsum = 0.0
-        vsum = 0.0
-        tw = 0.0
-        vw = 0.0
-        tww = 0.0
-        for t, v in pts:
-            age_h = max((t_end - t) / 3600.0, 0.0)
-            w = 0.5 ** (age_h / HALF_LIFE_H)
-            wsum += w
-            vsum += w * v
-            tw += w * t
-            vw += w * v * (t - t_end) / 3600.0
-            tww += w * ((t - t_end) / 3600.0) ** 2
-        if wsum == 0:
-            continue
-        theta[uid] = vsum / wsum
-        # Weighted slope of value per hour, from the same moments:
-        # slope = cov(t,v)/var(t) using weighted means.
-        mean_t = tw / wsum
-        mean_v = vsum / wsum
-        cov = 0.0
-        var = 0.0
-        for t, v in pts:
-            age_h = max((t_end - t) / 3600.0, 0.0)
-            w = 0.5 ** (age_h / HALF_LIFE_H)
-            dt = (t - mean_t) / 3600.0
-            cov += w * dt * (v - mean_v)
-            var += w * dt * dt
-        slope = cov / var if var > 1.0 else 0.0
-        n = len(pts)
-        slope *= n / (n + DRIFT_SHRINK)
-        drift[uid] = max(-DRIFT_CAP, min(DRIFT_CAP, slope))
-    return theta, drift
-
-
 def build_forecast(reads, task):
     places = int(task.get("places", 10))
-    window = task.get("window") or {}
-    hours = int(window.get("slots", 72))
     t_end = reads[-1]["t"]
-    if task.get("history_until"):
-        t_end = max(t_end, parse_time(task["history_until"]))
-    theta, drift = strengths(reads, t_end)
-    created = created_epochs(reads)
 
-    # Candidate field: strongest 170 games -- anyone with a realistic path
-    # into the top 10 during the window, risers from deep included.
-    field = sorted(theta, key=lambda u: -theta[u])[:170]
-    base = [theta[u] for u in field]
-    dr = [drift[u] for u in field]
-    # Hour (from t_end) at which each game ages out, or None.
-    age_out = []
-    for u in field:
-        c = created.get(u)
-        if c is None:
-            age_out.append(None)
-        else:
-            age_out.append((c + AGE_LIMIT_DAYS * 86400.0 - t_end) / 3600.0)
+    counts = {}     # (universe_id, place) -> recency-weighted reads there
+    presence = {}   # universe_id -> recency-weighted reads in any top place
+    tot_place = [0.0] * (places + 1)
+    tot_presence = 0.0
+    for rec in reads:
+        age_h = max((t_end - rec["t"]) / 3600.0, 0.0)
+        w = 0.5 ** (age_h / HALF_LIFE_H)
+        for rank, uid in rec["rows"][:places]:
+            counts[(uid, rank)] = counts.get((uid, rank), 0.0) + w
+            presence[uid] = presence.get(uid, 0.0) + w
+            tot_place[rank] += w
+            tot_presence += w
+    if tot_presence == 0:
+        raise ValueError("history holds no top-10 rows")
 
-    churn = churn_rate(reads)
-    # Archive-era churn is ~0.24 per sqrt(hour); scale the noise with what
-    # this history actually shows, clamped so odd inputs stay sane.
-    sigma_scale = max(0.7, min(1.5, churn / 0.24))
-    rng = random.Random(SEED)
-    counts = [[0.0] * places for _ in field]
-    total_draws = 0
-    for h in range(1, hours + 1):
-        frac = h / hours
-        sigma = SIGMA_24 * math.sqrt(1.0 + 2.0 * frac) * sigma_scale
-        sigma = max(sigma, SIGMA_24 * SIGMA_MIN_FRAC)
-        alive = [i for i in range(len(field))
-                 if age_out[i] is None or age_out[i] > h]
-        if not alive:
-            break
-        means = [base[i] + dr[i] * h for i in alive]
-        for _ in range(DRAWS):
-            scored = [(means[j] + rng.gauss(0.0, sigma), alive[j])
-                      for j in range(len(alive))]
-            scored.sort(key=lambda x: -x[0])
-            for place0 in range(min(places, len(scored))):
-                counts[scored[place0][1]][place0] += 1.0
-        total_draws += DRAWS
+    # Prior for every place: the game's share of all top-10 slots.
+    prior = {u: c / tot_presence for u, c in presence.items()}
+
+    dist = {}   # place -> {universe_id: probability}, before the unnamed cut
+    for k in range(1, places + 1):
+        denom = tot_place[k] + SHRINKAGE
+        d = {u: (counts.get((u, k), 0.0) + SHRINKAGE * prior[u]) / denom
+             for u in presence}
+        if TEMPERATURE != 1.0:
+            d = {u: p ** (1.0 / TEMPERATURE) for u, p in d.items()}
+            s = sum(d.values())
+            d = {u: p / s for u, p in d.items()}
+        dist[k] = d
 
     probabilities = []
     game_score = {}
-    for place in range(1, places + 1):
-        rows = []
-        for i, uid in enumerate(field):
-            p = counts[i][place - 1] / total_draws if total_draws else 0.0
-            if p >= MIN_ROW_P:
-                rows.append((uid, p))
-        rows.sort(key=lambda x: -x[1])
-        rows = rows[:MAX_ROWS_PER_PLACE]
-        cap = 1.0 - UNNAMED.get(place, 0.15)
+    for k in range(1, places + 1):
+        rows = sorted(dist[k].items(), key=lambda x: -x[1])[:MAX_ROWS_PER_PLACE]
         tot = sum(p for _, p in rows)
-        if tot > cap and tot > 0:
-            rows = [(u, p * cap / tot) for u, p in rows]
+        if tot > 0:
+            rows = [(u, p * (1.0 - UNNAMED) / tot) for u, p in rows]
         for uid, p in rows:
             p = round(p, 6)
-            if p <= 0:
+            if p < MIN_ROW_P or p <= 0:
                 continue
-            probabilities.append({"universe_id": uid, "place": place, "p": p})
-            game_score[uid] = game_score.get(uid, 0.0) + p * (places + 1 - place)
+            probabilities.append({"universe_id": uid, "place": k, "p": p})
+            game_score[uid] = game_score.get(uid, 0.0) + p * (places + 1 - k)
     # Guarantee each place's rounded sum stays <= 1: trim the largest row.
     by_place = {}
     for row in probabilities:
@@ -249,9 +131,29 @@ def build_forecast(reads, task):
             big["p"] = round(big["p"] - (s - 1.0) - 1e-6, 6)
     probabilities.sort(key=lambda r: (r["place"], -r["p"], r["universe_id"]))
 
-    top10 = [u for u, _ in sorted(game_score.items(), key=lambda x: -x[1])[:places]]
-    if len(top10) < places:  # degenerate history: fall back to the last chart
-        for _, uid in reads[-1]["rows"]:
+    # Top 10 by greedy assignment on the marginal matrix.
+    cells = sorted(
+        ((p, u, k) for k in range(1, places + 1) for u, p in dist[k].items()),
+        key=lambda x: -x[0],
+    )
+    used_games, used_places, assign = set(), set(), {}
+    for _p, uid, k in cells:
+        if uid in used_games or k in used_places:
+            continue
+        assign[k] = uid
+        used_games.add(uid)
+        used_places.add(k)
+        if len(assign) == places:
+            break
+    top10 = [assign[k] for k in range(1, places + 1) if k in assign]
+    if len(top10) < places:  # degenerate table: fill by expected agreement
+        for uid, _s in sorted(game_score.items(), key=lambda x: -x[1]):
+            if uid not in top10:
+                top10.append(uid)
+            if len(top10) == places:
+                break
+    if len(top10) < places:  # last resort: the closing chart as it stood
+        for _rank, uid in reads[-1]["rows"]:
             if uid not in top10:
                 top10.append(uid)
             if len(top10) == places:
