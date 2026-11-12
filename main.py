@@ -9,18 +9,28 @@ the 72 hours after the history ends, so the quantity that pays is the
 *time-averaged* probability that each game holds each place over the
 window -- a marginal distribution, not a trajectory.
 
-Model: the empirical place-occupancy table of the history itself.
-  * Each read contributes its top 10 to a per-(game, place) count, weighted
-    by recency with a 6-hour half-life, so the table describes the chart's
-    current regime rather than its whole past.
+Model: the empirical place-occupancy table of the history itself, with
+constants chosen on an exact replica of the contest's practice benchmark
+(fit on the 34 practice reads, scored on the real 10 reads of the
+practice window, fetched from the same public snapshot archive the
+contest uses; the shipped v2 recipe scored -37.9 there, this one -36.3,
+and the whole neighbourhood of these constants is flat, so they are a
+plateau, not a peak):
+  * Each read contributes its top 10 to a per-(game, place) count,
+    weighted by recency with a 9-hour half-life in *time*, so the table
+    tracks the chart's current regime; because the weight is time-based,
+    the dense hourly reads at the end of the final history dominate the
+    sparse archive reads exactly as they should.
   * Counts are shrunk toward the game's overall top-10 presence share
     (strength 10): a place a game held rarely still gets the probability
-    its general presence earns, which keeps the table honest when the
-    recency-weighted sample is a handful of reads.
-  * A mild temperature (0.95) is applied and each place is renormalised,
-    then 15% of every place is left unnamed: the share for games outside
-    the history's top 10 (new publications enter this chart constantly),
-    which the scoring spreads over the read's unnamed chart games.
+    its general presence earns.
+  * A mild temperature (0.85) sharpens the table slightly and each place
+    is renormalised, then 37.5% of every place is left unnamed: the
+    window churns hard (a median of 6 of 10 places change between reads
+    a few hours apart, and a closing #1 can vanish entirely), so the
+    unnamed share -- which the scoring spreads over each read's unnamed
+    chart games -- is the forecast's insurance, and the benchmark says
+    it is the single biggest lever after the half-life.
   * The top 10 list is a greedy assignment on the marginal matrix: the
     largest remaining (game, place) probability is fixed first, which is
     the order that maximises expected agreement.
@@ -34,10 +44,10 @@ import os
 import sys
 from datetime import datetime
 
-HALF_LIFE_H = 6.0        # recency half-life of a read's weight, in hours
+HALF_LIFE_H = 9.0        # recency half-life of a read's weight, in hours
 SHRINKAGE = 10.0         # pseudo-count strength of the presence prior
-TEMPERATURE = 0.95       # p -> p ** (1 / T), renormalised per place
-UNNAMED = 0.15           # share of each place left for games outside the table
+TEMPERATURE = 0.85       # p -> p ** (1 / T), renormalised per place
+UNNAMED = 0.375          # share of each place left for games outside the table
 MIN_ROW_P = 0.001        # smallest probability worth naming a row for
 MAX_ROWS_PER_PLACE = 100
 
@@ -171,6 +181,19 @@ def main():
         print("no usable reads in history", file=sys.stderr)
         return 1
     forecast = build_forecast(reads, task)
+    # Contract guard: a malformed forecast scores the floor at every place,
+    # so refuse to write one -- each place's named mass must stay <= 1 and
+    # the top 10 must name exactly `places` distinct games.
+    places = int(task.get("places", 10))
+    sums = {}
+    for row in forecast["probabilities"]:
+        sums[row["place"]] = sums.get(row["place"], 0.0) + row["p"]
+    if any(s > 1.0 for s in sums.values()):
+        print("forecast violates the per-place mass cap", file=sys.stderr)
+        return 1
+    if len(forecast["top10"]) != places or len(set(forecast["top10"])) != places:
+        print("forecast top10 is not exactly the scored places", file=sys.stderr)
+        return 1
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, task.get("output", "forecast.json"))
     with open(out_path, "w", encoding="utf-8") as fh:
